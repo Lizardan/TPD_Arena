@@ -44,7 +44,17 @@ jobs:
           rm .secrets.json
 
       - name: Deploy
-        run: npx wrangler deploy
+        id: deploy
+        shell: bash
+        run: |
+          OUTPUT=$(npx wrangler deploy 2>&1)
+          echo "$OUTPUT"
+          URL=$(echo "$OUTPUT" | grep -oE 'https://tpd-arena-bot\.[a-zA-Z0-9-]+\.workers\.dev/?' | head -1)
+          if [ -z "$URL" ]; then
+            echo "::error::Could not extract workers.dev URL from deploy output"
+            exit 1
+          fi
+          echo "WORKER_URL=${URL%/}" >> "$GITHUB_ENV"
 
       - name: Set Telegram webhook
         shell: bash
@@ -52,7 +62,7 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/deleteWebhook"
           echo
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook" \
-            --data-urlencode "url=https://tpd-arena-bot.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev/hook" \
+            --data-urlencode "url=${{ env.WORKER_URL }}/hook" \
             --data-urlencode "secret_token=${{ secrets.WEBHOOK_SECRET }}" \
             --data-urlencode 'allowed_updates=["message","callback_query"]' \
             --data-urlencode "drop_pending_updates=true"
