@@ -1,5 +1,5 @@
 import { simulateBattle, ATTACK_DUR } from './battle.js';
-import { drawTextCentered } from './font.js';
+import { drawTextCentered, measureText } from './font.js';
 
 export const FREE_PROFILE = {
   width: 128,
@@ -29,6 +29,8 @@ const POPUP_DUR = 0.7;
 const ARM_BASE = 4;
 const ARM_EXT_MAX = 8;
 const LUNGE_MAX = 6;
+const NAME_SCALE = 2;
+const MAX_NAME_W = 48;
 
 export function hexToRgb(hex) {
   if (typeof hex !== 'string') return null;
@@ -264,13 +266,19 @@ function drawFighter(buf, w, h, fy, cx, face, st, body, bodyShade, bodyLight) {
 function drawHud(buf, w, h, fy, cx, st, battle, side) {
   const headTop = fy - 4 - 14 - 5 - 5 + 1;
   const barY = headTop - 7;
-  const nameY = barY - 6;
+  const nameY = barY - 10;
   const barW = 24;
   const frac = st.maxHp > 0 ? st.hp / st.maxHp : 0;
 
-  const name = (battle.fighters[side].name || '???').toUpperCase();
-  const shortName = name.length > 8 ? name.slice(0, 7) + '.' : name;
-  drawTextCentered(buf, w, h, shortName, cx, nameY, PAL.white, 1);
+  let label = (battle.fighters[side].name || '???').toUpperCase();
+  while (label.length > 1 && measureText(label) * NAME_SCALE > MAX_NAME_W) {
+    label = label.slice(0, -1);
+  }
+
+  // Dark pill behind the name so it stays readable over the sky.
+  const tw = Math.round(measureText(label) * NAME_SCALE / 2);
+  fillRect(buf, w, h, cx - tw - 2, nameY - 1, tw * 2 + 4, 12, PAL.shadow);
+  drawTextCentered(buf, w, h, label, cx, nameY, PAL.white, NAME_SCALE);
 
   const bx = cx - barW / 2;
   fillRect(buf, w, h, bx, barY + 1, barW, 3, PAL.hpBg);

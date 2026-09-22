@@ -8,8 +8,7 @@ const COLORS = ['#ff9b3d', '#4da6ff', '#e74c3c', '#2ecc71', '#9b59b6', '#f1c40f'
 
 function displayName(from) {
   if (!from) return 'Боец';
-  if (from.username) return `@${from.username}`;
-  return from.first_name || 'Боец';
+  return from.username || from.first_name || 'Боец';
 }
 
 function shortName(name) {
