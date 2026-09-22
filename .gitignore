@@ -1,0 +1,9 @@
+# opencode session state
+.opencode/
+
+# generated debug output
+bot/test/out/
+
+# local env / secrets
+*.local.toml
+*.dev.vars

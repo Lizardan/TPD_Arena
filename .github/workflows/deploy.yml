@@ -1,0 +1,59 @@
+name: Deploy TPD Arena Bot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bot
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bot/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Ensure KV namespace
+        run: node scripts/ensure-kv.mjs
+
+      - name: Set worker secrets
+        shell: bash
+        run: |
+          printf '{"BOT_TOKEN":"%s","WEBHOOK_SECRET":"%s"}' \
+            "${{ secrets.BOT_TOKEN }}" "${{ secrets.WEBHOOK_SECRET }}" > .secrets.json
+          npx wrangler secret bulk .secrets.json
+          rm .secrets.json
+
+      - name: Deploy
+        run: npx wrangler deploy
+
+      - name: Set Telegram webhook
+        shell: bash
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/deleteWebhook"
+          echo
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook" \
+            --data-urlencode "url=https://tpd-arena-bot.${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev/hook" \
+            --data-urlencode "secret_token=${{ secrets.WEBHOOK_SECRET }}" \
+            --data-urlencode 'allowed_updates=["message","callback_query"]' \
+            --data-urlencode "drop_pending_updates=true"
+          echo

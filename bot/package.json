@@ -1,0 +1,20 @@
+{
+  "name": "tpd-arena-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram arena bot + GIF battle renderer on Cloudflare Workers",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "bench": "node test/bench.mjs"
+  },
+  "dependencies": {
+    "gifenc": "^1.0.3"
+  },
+  "devDependencies": {
+    "vitest": "^3.1.1",
+    "wrangler": "^4.136.0"
+  }
+}

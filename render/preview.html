@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TPD Arena — превью боя</title>
+<style>
+  :root { --bg:#14141f; --panel:#1d1d2b; --line:#2c2c42; --txt:#e8e8f0; --acc:#ff9b3d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:20px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:#9a9ab0; margin-bottom:16px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:14px; }
+  canvas { width:100%; image-rendering:pixelated; background:#000; border-radius:6px; display:block; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:12px; }
+  button { background:#2f2f48; color:var(--txt); border:1px solid var(--line); border-radius:6px; padding:6px 12px; cursor:pointer; font-size:13px; }
+  button:hover { background:#3a3a56; }
+  button.primary { background:var(--acc); color:#1a1208; border-color:var(--acc); }
+  input[type=range] { flex:1; min-width:120px; }
+  code { background:#00000044; padding:1px 5px; border-radius:4px; font-size:12px; color:#ffd77a; }
+  .stats { display:flex; gap:14px; flex-wrap:wrap; font-size:13px; color:#b8b8cc; margin-top:10px; }
+  .stats b { color:var(--txt); }
+  .events { font-size:12px; color:#9a9ab0; max-height:120px; overflow:auto; white-space:pre; margin-top:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>⚔️ TPD Arena — превью боя</h1>
+  <div class="sub">Живой показ боя тем же рендером, что генерирует GIF для Telegram. Проглотится <code>?battle=&lt;base64url JSON&gt;</code>.</div>
+
+  <div class="panel">
+    <canvas id="cv" width="128" height="96"></canvas>
+    <div class="row">
+      <button id="btnRandom" class="primary">🎲 Случайный бой</button>
+      <button id="btnPlay">⏸ Пауза</button>
+      <button id="btnStep">Кадр +</button>
+      <input id="slider" type="range" min="0" value="0">
+      <span id="frameLabel">0 / 0</span>
+    </div>
+    <div class="stats">
+      <span>Бой: <b id="dur">–</b></span>
+      <span>Победитель: <b id="winner">–</b></span>
+      <span>Скорость: <b id="speed">1×</b></span>
+    </div>
+    <div class="events" id="events"></div>
+  </div>
+
+  <div class="panel">
+    <div>JSON запроса (пример):</div>
+    <div class="events" style="max-height:none" id="jsonBox"></div>
+  </div>
+</main>
+
+<script type="module">
+import { renderBattle, FREE_PROFILE } from '../bot/src/renderer.js';
+import { simulateBattle } from '../bot/src/battle.js';
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const slider = document.getElementById('slider');
+const frameLabel = document.getElementById('frameLabel');
+const durEl = document.getElementById('dur');
+const winnerEl = document.getElementById('winner');
+const speedEl = document.getElementById('speed');
+const eventsEl = document.getElementById('events');
+const jsonBox = document.getElementById('jsonBox');
+const btnRandom = document.getElementById('btnRandom');
+const btnPlay = document.getElementById('btnPlay');
+const btnStep = document.getElementById('btnStep');
+
+let state = { frames: [], palette: [], width: 1, height: 1, battle: null, current: 0, playing: false, speed: 1 };
+
+const NAMES = ['Иван', 'Петя', 'Дракон', 'Арти', 'Макс', 'Лора', 'КиБ', 'Зевс'];
+const COLORS = ['#ff9b3d', '#4da6ff', '#e74c3c', '#2ecc71', '#9b59b6', '#f1c40f'];
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+function randomBattle() {
+  const both = () => ({
+    name: pick(NAMES),
+    hp: Math.round(rand(80, 160)),
+    attackPower: Math.round(rand(6, 22)),
+    attackSpeed: Math.round(rand(6, 18)) / 10,
+    color: pick(COLORS),
+  });
+  return { left: both(), right: both() };
+}
+
+function drawFrame(i) {
+  const idx = state.frames[i];
+  const img = ctx.createImageData(state.width, state.height);
+  for (let p = 0; p < idx.length; p++) {
+    const c = state.palette[idx[p]];
+    img.data[p * 4] = c[0];
+    img.data[p * 4 + 1] = c[1];
+    img.data[p * 4 + 2] = c[2];
+    img.data[p * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  frameLabel.textContent = `${i + 1} / ${state.frames.length}`;
+  slider.value = i;
+}
+
+function load(battleJson, label) {
+  const r = renderBattle(battleJson, FREE_PROFILE);
+  state = {
+    frames: r.frames, palette: r.palette, width: r.width, height: r.height,
+    battle: simulateBattle(battleJson), current: 0, playing: true, speed: 1,
+  };
+  slider.max = Math.max(0, r.frames.length - 1);
+  cv.width = r.width; cv.height = r.height;
+  durEl.textContent = `${state.battle.duration.toFixed(2)} s → видео ${(r.frames.length / FREE_PROFILE.fps).toFixed(2)} s`;
+  winnerEl.textContent = state.battle.fighters[state.battle.winner].name;
+  speedEl.textContent = '1×';
+
+  const ev = state.battle.events.filter(e => e.type !== 'end');
+  eventsEl.textContent = ev.map(e => {
+    if (e.type === 'attack') return `t=${e.t.toFixed(2)}  ATTACK ${e.who}`;
+    return `t=${e.t.toFixed(2)}  IMPACT ${e.attacker}→${e.target} dmg=${e.damage} hp=${e.hpAfter}`;
+  }).join('\n');
+
+  jsonBox.textContent = JSON.stringify(battleJson, null, 2) + (label ? `\n\n(${label})` : '');
+  drawFrame(0);
+}
+
+let timer = null;
+function schedule() {
+  clearInterval(timer);
+  if (!state.playing) return;
+  const ms = 1000 / (FREE_PROFILE.fps * state.speed);
+  timer = setInterval(() => {
+    state.current = (state.current + 1) % state.frames.length;
+    drawFrame(state.current);
+  }, ms);
+}
+
+btnRandom.addEventListener('click', () => {
+  load(randomBattle(), 'случайный');
+  btnRandom.textContent = '🎲 Случайный бой заново';
+});
+btnPlay.addEventListener('click', () => {
+  state.playing = !state.playing;
+  btnPlay.textContent = state.playing ? '⏸ Пауза' : '▶ Играть';
+  schedule();
+});
+btnStep.addEventListener('click', () => {
+  state.playing = false;
+  btnPlay.textContent = '▶ Играть';
+  clearInterval(timer);
+  state.current = (state.current + 1) % state.frames.length;
+  drawFrame(state.current);
+});
+slider.addEventListener('input', () => {
+  state.current = Number(slider.value);
+  drawFrame(state.current);
+});
+speedEl.addEventListener('click', () => {
+  state.speed = state.speed === 1 ? 2 : state.speed === 2 ? 0.5 : 1;
+  speedEl.textContent = `${state.speed}×`;
+  schedule();
+});
+
+// Load from URL: ?battle=<base64url json>
+const url = new URL(location.href);
+const param = url.searchParams.get('battle');
+let label = null;
+if (param) {
+  label = 'из URL';
+  try {
+    let padded = param.replace(/-/g, '+').replace(/_/g, '/');
+    while (padded.length % 4) padded += '=';
+    const json = new TextDecoder().decode(Uint8Array.from(atob(padded), c => c.charCodeAt(0)));
+    load(JSON.parse(json), label);
+  } catch (err) {
+    jsonBox.textContent = `Ошибка разбора battle param: ${err.message}`;
+  }
+} else {
+  const b = randomBattle();
+  label = 'случайный';
+  load(b, label);
+}
+</script>
+</body>
+</html>

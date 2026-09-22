@@ -1,0 +1,19 @@
+name = "tpd-arena-bot"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+# Secrets (set automatically by CI, or via `wrangler secret put NAME`):
+#   BOT_TOKEN       - Telegram bot token from @BotFather
+#   WEBHOOK_SECRET  - random string, must match setWebhook secret_token
+#
+# KV namespace for arena state.
+# CI creates it automatically (bot/scripts/ensure-kv.mjs) and fills <AUTO> with the real id.
+# For a manual setup: npx wrangler kv namespace create ARENAS and paste the id here.
+
+kv_namespaces = [
+  { binding = "ARENAS", id = "<AUTO>" }
+]
+
+[vars]
+# Optional: require `X-Render-Key: <key>` header on POST /render
+# RENDER_KEY = ""
