@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { internals } from '../src/index.js';
-import { arenaKey } from '../src/arena.js';
+import { arenaKey, menuKey } from '../src/arena.js';
 
 function makeFakeKv() {
   const map = new Map();
@@ -81,6 +81,25 @@ function lastByMethod(calls, method) {
   return found[found.length - 1];
 }
 
+/** The arena card is the message carrying an inline keyboard, not the menu hint. */
+function arenaCardCall(calls) {
+  const found = calls.filter(
+    (c) => c.method === 'sendMessage' && c.body.reply_markup && c.body.reply_markup.inline_keyboard,
+  );
+  return found[found.length - 1];
+}
+
+/** Messages that carry the persistent bottom keyboard. */
+function keyboardCalls(calls) {
+  return calls.filter(
+    (c) => c.method === 'sendMessage' && c.body.reply_markup && c.body.reply_markup.keyboard,
+  );
+}
+
+function joinData(calls) {
+  return arenaCardCall(calls).body.reply_markup.inline_keyboard[0][0].callback_data;
+}
+
 describe('webhook flow', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -90,10 +109,10 @@ describe('webhook flow', () => {
     const { env, kv } = makeEnv();
     const calls = mockTelegram();
     await internals.handleMessage(env, messageUpdate('/arena', creatorId));
-    const sm = lastByMethod(calls, 'sendMessage');
-    expect(sm).toBeDefined();
-    expect(sm.body.reply_markup.inline_keyboard[0][0].text).toMatch(/Выйти против/);
-    expect(sm.body.reply_markup.inline_keyboard[0][0].callback_data).toMatch(/^a\|-100123456\|/);
+    const card = arenaCardCall(calls);
+    expect(card).toBeDefined();
+    expect(card.body.reply_markup.inline_keyboard[0][0].text).toMatch(/Выйти против/);
+    expect(card.body.reply_markup.inline_keyboard[0][0].callback_data).toMatch(/^a\|-100123456\|/);
     expect(kv.map.has(arenaKey(chatId))).toBe(true);
   });
 
@@ -101,8 +120,7 @@ describe('webhook flow', () => {
     const { env } = makeEnv();
     const calls = mockTelegram();
     await internals.handleMessage(env, messageUpdate('/arena', creatorId));
-    const data = lastByMethod(calls, 'sendMessage').body.reply_markup.inline_keyboard[0][0].callback_data;
-    await internals.handleCallback(env, callbackUpdate(data, creatorId));
+    await internals.handleCallback(env, callbackUpdate(joinData(calls), creatorId));
     const ans = lastByMethod(calls, 'answerCallbackQuery');
     expect(ans.body.text).toMatch(/твой вызов/);
     expect(calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0);
@@ -112,8 +130,7 @@ describe('webhook flow', () => {
     const { env, kv } = makeEnv();
     const calls = mockTelegram();
     await internals.handleMessage(env, messageUpdate('/arena', creatorId));
-    const data = lastByMethod(calls, 'sendMessage').body.reply_markup.inline_keyboard[0][0].callback_data;
-    await internals.handleCallback(env, callbackUpdate(data, joinerId));
+    await internals.handleCallback(env, callbackUpdate(joinData(calls), joinerId));
 
     const edit = lastByMethod(calls, 'editMessageText');
     expect(edit.body.text).toMatch(/🔥 ИДЁТ БОЙ/);
@@ -130,7 +147,7 @@ describe('webhook flow', () => {
     const { env } = makeEnv();
     const calls = mockTelegram();
     await internals.handleMessage(env, messageUpdate('/arena', creatorId));
-    const data = lastByMethod(calls, 'sendMessage').body.reply_markup.inline_keyboard[0][0].callback_data;
+    const data = joinData(calls);
     await internals.handleCallback(env, callbackUpdate(data, joinerId));
     calls.length = 0;
     await internals.handleCallback(env, callbackUpdate(data, 333));
@@ -145,6 +162,7 @@ describe('webhook flow', () => {
     await internals.handleMessage(env, messageUpdate('/arena', creatorId, 'private'));
     const sm = lastByMethod(calls, 'sendMessage');
     expect(sm.body.text).toMatch(/только в групповых чатах/);
+    expect(keyboardCalls(calls)).toHaveLength(0);
   });
 
   it('recognises arena command variants', () => {
@@ -152,5 +170,139 @@ describe('webhook flow', () => {
       expect(internals.isArenaCommand(t)).toBe(true);
     }
     expect(internals.isArenaCommand('/help')).toBe(false);
+  });
+
+  it('recognises the bottom keyboard button label', () => {
+    expect(internals.isArenaCommand(internals.ARENA_BUTTON)).toBe(true);
+    expect(internals.isArenaCommand('выйти на арену')).toBe(true);
+    expect(internals.isArenaCommand('Выйти на арену!')).toBe(true);
+    expect(internals.isArenaCommand('выйти на улицу')).toBe(false);
+  });
+});
+
+describe('command menu', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('exposes a single command — arena', () => {
+    expect(internals.BOT_COMMANDS).toEqual([{ command: 'arena', description: 'Выйти на арену' }]);
+  });
+
+  it('registers the menu once per worker instance', async () => {
+    const calls = mockTelegram();
+    const pending = [];
+    const ctx = { waitUntil: (p) => pending.push(p) };
+    const { env } = makeEnv();
+
+    const request = () => new Request('https://bot.example/hook', {
+      method: 'POST',
+      headers: { 'x-telegram-bot-api-secret-token': 's3cret' },
+      body: JSON.stringify(messageUpdate('/arena', creatorId)),
+    });
+
+    await internals.handleWebhook(request(), env, ctx);
+    await internals.handleWebhook(request(), env, ctx);
+    await Promise.all(pending);
+
+    const syncs = calls.filter((c) => c.method === 'setMyCommands');
+    expect(syncs).toHaveLength(1);
+    expect(syncs[0].body.commands).toEqual(internals.BOT_COMMANDS);
+  });
+});
+
+describe('bottom keyboard', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('installs a persistent styled keyboard once per chat', async () => {
+    const { env, kv } = makeEnv();
+    const calls = mockTelegram();
+
+    await internals.handleMessage(env, messageUpdate('/arena', creatorId));
+
+    const kbs = keyboardCalls(calls);
+    expect(kbs).toHaveLength(1);
+    const markup = kbs[0].body.reply_markup;
+    expect(markup.is_persistent).toBe(true);
+    expect(markup.resize_keyboard).toBe(true);
+    expect(markup.input_field_placeholder).toBe('Кнопки или /arena');
+    expect(markup.keyboard[0][0].text).toBe(internals.ARENA_BUTTON);
+    expect(markup.keyboard[0][0].style).toBe('primary');
+    expect(kv.map.has(menuKey(chatId))).toBe(true);
+
+    // A second arena in the same chat must not re-post the keyboard.
+    kv.map.delete(arenaKey(chatId));
+    calls.length = 0;
+    await internals.handleMessage(env, messageUpdate('/arena', joinerId));
+    expect(keyboardCalls(calls)).toHaveLength(0);
+    expect(arenaCardCall(calls)).toBeDefined();
+  });
+
+  it('styles the arena card buttons', async () => {
+    const { env } = makeEnv();
+    const calls = mockTelegram();
+    await internals.handleMessage(env, messageUpdate('/arena', creatorId));
+
+    const rows = arenaCardCall(calls).body.reply_markup.inline_keyboard;
+    expect(rows).toHaveLength(2);
+    expect(rows[0][0].style).toBe('success');
+    expect(rows[1][0].style).toBe('danger');
+    expect(rows[1][0].text).toMatch(/Офнуть все арены/);
+    expect(rows[1][0].callback_data).toBe(`o|${chatId}`);
+  });
+});
+
+describe('off all arenas', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('cancels the pending arena and strips the buttons', async () => {
+    const { env, kv } = makeEnv();
+    const calls = mockTelegram();
+    await internals.handleMessage(env, messageUpdate('/arena', creatorId));
+
+    const offData = arenaCardCall(calls).body.reply_markup.inline_keyboard[1][0].callback_data;
+    calls.length = 0;
+
+    await internals.handleCallback(env, callbackUpdate(offData, joinerId));
+
+    expect(lastByMethod(calls, 'answerCallbackQuery').body.text).toMatch(/закрыты/);
+    const edit = lastByMethod(calls, 'editMessageText');
+    expect(edit.body.text).toMatch(/АРЕНЫ ЗАКРЫТЫ/);
+    expect(edit.body.reply_markup.inline_keyboard).toHaveLength(0);
+    expect(kv.map.has(arenaKey(chatId))).toBe(false);
+    // Nobody joined, so no fight was started.
+    expect(calls.filter((c) => c.method === 'sendAnimation')).toHaveLength(0);
+  });
+
+  it('lets the creator cancel their own arena too', async () => {
+    const { env, kv } = makeEnv();
+    const calls = mockTelegram();
+    await internals.handleMessage(env, messageUpdate('/arena', creatorId));
+    const offData = arenaCardCall(calls).body.reply_markup.inline_keyboard[1][0].callback_data;
+    calls.length = 0;
+
+    await internals.handleCallback(env, callbackUpdate(offData, creatorId));
+
+    expect(lastByMethod(calls, 'answerCallbackQuery').body.text).toMatch(/закрыты/);
+    expect(kv.map.has(arenaKey(chatId))).toBe(false);
+  });
+
+  it('reports an empty chat instead of failing', async () => {
+    const { env } = makeEnv();
+    const calls = mockTelegram();
+    await internals.handleCallback(env, callbackUpdate(`o|${chatId}`, joinerId));
+    expect(lastByMethod(calls, 'answerCallbackQuery').body.text).toMatch(/нет активных арен/);
+    expect(calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0);
+  });
+
+  it('is not mistaken for an arena join', () => {
+    expect(internals.parseOffAll(`o|${chatId}`)).toEqual({ chatId });
+    expect(internals.parseOffAll('a|-100123456|abcd')).toBeNull();
+    expect(internals.parseCallback(`o|${chatId}`)).toBeNull();
+    expect(internals.parseCallback('a|-100123456|abcd')).toEqual({ chatId, arenaId: 'abcd' });
   });
 });

@@ -24,6 +24,9 @@ export function createTelegram(env) {
   }
 
   return {
+    async setMyCommands(commands) {
+      return json('setMyCommands', { commands });
+    },
     async sendMessage(chatId, text, opts = {}) {
       return json('sendMessage', { chat_id: chatId, text, ...opts });
     },

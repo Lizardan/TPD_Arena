@@ -2,9 +2,28 @@ import { simulateBattle, battleResultText } from './battle.js';
 import { renderBattle } from './renderer.js';
 import { encodeGif } from './gif.js';
 import { createTelegram } from './telegram.js';
-import { loadArena, saveArena, deleteArena, randId } from './arena.js';
+import {
+  loadArena,
+  saveArena,
+  deleteArena,
+  cancelArenas,
+  loadMenu,
+  saveMenu,
+  randId,
+} from './arena.js';
 
 const COLORS = ['#ff9b3d', '#4da6ff', '#e74c3c', '#2ecc71', '#9b59b6', '#f1c40f', '#1abc9c', '#e67e22'];
+
+/**
+ * The only command in the bot menu. Everything else the user needs is a button.
+ * Applied by CI on deploy and re-applied lazily by the worker (see syncCommands).
+ */
+const BOT_COMMANDS = [{ command: 'arena', description: 'Выйти на арену' }];
+
+/** Label of the persistent bottom keyboard button. Pressing it sends this text. */
+const ARENA_BUTTON = '⚔️ Выйти на арену';
+
+const MENU_HINT = '⚔️ Кнопка «Выйти на арену» теперь всегда внизу 👇';
 
 function displayName(from) {
   if (!from) return 'Боец';
@@ -44,6 +63,33 @@ function mulberry32(seed) {
   };
 }
 
+/**
+ * Lower-cases the text and throws away everything that is not a letter, digit
+ * or `@` — emoji, punctuation, slashes. So `/arena@MyBot`, `⚔️ Выйти на арену`
+ * and `выйти   на арену!` all collapse to something comparable.
+ */
+const NOT_WORD = /[^a-z0-9а-яё@]+/g;
+
+function normalizeText(text) {
+  return String(text == null ? '' : text)
+    .toLowerCase()
+    .replace(NOT_WORD, ' ')
+    .split(' ')
+    .filter(Boolean)
+    .join(' ');
+}
+
+const ARENA_WORDS = ['arena', 'арена'];
+const BUTTON_WORD = normalizeText(ARENA_BUTTON); // 'выйти на арену'
+
+function isArenaCommand(text) {
+  const t = normalizeText(text);
+  if (!t) return false;
+  if (ARENA_WORDS.includes(t)) return true;
+  if (ARENA_WORDS.some((w) => t.startsWith(`${w}@`))) return true;
+  return t === BUTTON_WORD;
+}
+
 function arenaText(arena) {
   const f = arena.left;
   return [
@@ -71,6 +117,55 @@ function fightAnnounce(arena) {
   ].join('\n');
 }
 
+function offAllText(from) {
+  return [
+    '🛑 АРЕНЫ ЗАКРЫТЫ',
+    '',
+    `Остановил: ${displayName(from)}`,
+    '',
+    'Написать /arena — открыть новую.',
+  ].join('\n');
+}
+
+/**
+ * Inline buttons on the arena card.
+ *
+ * `style` colours the button (blue/green/red) in Telegram clients released
+ * after 9 Feb 2026; older clients simply render it unstyled. Custom emoji icons
+ * (`icon_custom_emoji_id`) are deliberately not used — they need a Fragment
+ * username or a Premium bot owner — so the emoji live inside the text.
+ */
+function arenaCard(arena) {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: `⚔️ Выйти против ${shortName(arena.left.name)}`,
+          callback_data: `a|${arena.chatId}|${arena.id}`,
+          style: 'success',
+        },
+      ],
+      [
+        {
+          text: '🛑 Офнуть все арены в чате',
+          callback_data: `o|${arena.chatId}`,
+          style: 'danger',
+        },
+      ],
+    ],
+  };
+}
+
+/** The persistent keyboard that sits under the chat input. */
+function arenaKeyboard() {
+  return {
+    resize_keyboard: true,
+    is_persistent: true,
+    input_field_placeholder: 'Кнопки или /arena',
+    keyboard: [[{ text: ARENA_BUTTON, style: 'primary' }]],
+  };
+}
+
 function parseCallback(data) {
   const parts = String(data).split('|');
   if (parts.length !== 3 || parts[0] !== 'a') return null;
@@ -79,12 +174,13 @@ function parseCallback(data) {
   return { chatId, arenaId: parts[2] };
 }
 
-function isArenaCommand(text) {
-  const t = text.trim().toLowerCase();
-  return t === '/arena' || t === '/арена'
-    || t === '/arena@' || t === '/арена@'
-    || t.startsWith('/arena@') || t.startsWith('/арена@')
-    || t === 'arena' || t === 'арена';
+/** Parses the "off all arenas" callback: `o|<chatId>`. */
+function parseOffAll(data) {
+  const parts = String(data).split('|');
+  if (parts.length !== 2 || parts[0] !== 'o') return null;
+  const chatId = Number(parts[1]);
+  if (!Number.isInteger(chatId)) return null;
+  return { chatId };
 }
 
 async function processFight(env, chatId, messageId, left, right) {
@@ -97,6 +193,19 @@ async function processFight(env, chatId, messageId, left, right) {
   await bot.deleteMessage(chatId, messageId).catch(() => {});
   const caption = [`⚔️ ${left.name} vs ${right.name}`, battleResultText(battle)].join('\n');
   await bot.sendAnimation(chatId, gif, caption);
+}
+
+/**
+ * Re-registers the command menu once per worker isolate, so the menu is correct
+ * even if it was edited by hand in BotFather. CI also calls setMyCommands on
+ * deploy; this is the self-healing fallback.
+ */
+let commandsSynced = false;
+
+function syncCommands(bot) {
+  if (commandsSynced) return null;
+  commandsSynced = true;
+  return bot.setMyCommands(BOT_COMMANDS).catch(() => {});
 }
 
 export default {
@@ -132,10 +241,17 @@ async function handleWebhook(request, env, ctx) {
     return new Response('bad request', { status: 400 });
   }
 
+  const canDefer = ctx && typeof ctx.waitUntil === 'function';
+
+  const sync = syncCommands(createTelegram(env));
+  if (sync && canDefer) ctx.waitUntil(sync);
+
   if (update.message && update.message.text) {
     await handleMessage(env, update);
   } else if (update.callback_query) {
-    ctx.waitUntil(handleCallback(env, update));
+    const job = handleCallback(env, update);
+    if (canDefer) ctx.waitUntil(job);
+    else await job;
   }
 
   return new Response('ok');
@@ -175,20 +291,28 @@ async function handleMessage(env, update) {
     right: null,
   };
 
-  const button = {
-    text: `⚔️ Выйти против ${shortName(arena.left.name)}`,
-    callback_data: `a|${chatId}|${arena.id}`,
-  };
-  const resp = await bot.sendMessage(chatId, arenaText(arena), {
-    reply_markup: { inline_keyboard: [[button]] },
-  });
+  const resp = await bot.sendMessage(chatId, arenaText(arena), { reply_markup: arenaCard(arena) });
   if (resp && resp.ok && resp.result) arena.messageId = resp.result.message_id;
   await saveArena(env, chatId, arena);
+
+  // A message carries either an inline keyboard or a reply keyboard, never both,
+  // so the bottom keyboard travels on its own small message. It is persistent,
+  // which is why it is installed only once per chat.
+  if (!(await loadMenu(env, chatId))) {
+    const sent = await bot
+      .sendMessage(chatId, MENU_HINT, { reply_markup: arenaKeyboard() })
+      .catch(() => null);
+    if (sent && sent.ok) await saveMenu(env, chatId);
+  }
 }
 
 async function handleCallback(env, update) {
   const bot = createTelegram(env);
   const cq = update.callback_query;
+
+  const off = parseOffAll(cq.data);
+  if (off) return handleOffAll(bot, env, cq, off.chatId);
+
   const parsed = parseCallback(cq.data);
   if (!parsed) {
     await bot.answerCallbackQuery(cq.id, 'Сломанная кнопка 🤔');
@@ -223,6 +347,29 @@ async function handleCallback(env, update) {
   return processFight(env, chatId, existing.messageId, existing.left, existing.right);
 }
 
+/** Anyone in the chat may press "off all arenas" — whoever does, the arena closes. */
+async function handleOffAll(bot, env, cq, chatId) {
+  const msgChatId = cq.message && cq.message.chat ? cq.message.chat.id : chatId;
+  if (msgChatId !== chatId) {
+    await bot.answerCallbackQuery(cq.id, 'Сломанная кнопка 🤔');
+    return;
+  }
+
+  const cancelled = await cancelArenas(env, chatId);
+  if (cancelled.length === 0) {
+    await bot.answerCallbackQuery(cq.id, 'В этом чате нет активных арен');
+    return;
+  }
+
+  await bot.answerCallbackQuery(cq.id, 'Арены закрыты 🛑');
+
+  const messageId = cq.message && cq.message.message_id;
+  if (messageId) {
+    // editMessageText drops the inline keyboard by default, so the buttons go away too.
+    await bot.editMessageText(chatId, messageId, offAllText(cq.from)).catch(() => {});
+  }
+}
+
 async function handleRender(request, env) {
   if (env.RENDER_KEY && request.headers.get('x-render-key') !== env.RENDER_KEY) {
     return new Response('unauthorized', { status: 401 });
@@ -251,9 +398,17 @@ export const internals = {
   handleWebhook,
   handleMessage,
   handleCallback,
+  handleOffAll,
   processFight,
   parseCallback,
+  parseOffAll,
   isArenaCommand,
+  normalizeText,
   displayName,
   rollStats,
+  arenaKeyboard,
+  arenaCard,
+  BOT_COMMANDS,
+  ARENA_BUTTON,
+  MENU_HINT,
 };

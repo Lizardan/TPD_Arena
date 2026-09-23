@@ -67,3 +67,24 @@ jobs:
             --data-urlencode 'allowed_updates=["message","callback_query"]' \
             --data-urlencode "drop_pending_updates=true"
           echo
+
+      - name: Set bot commands
+        shell: bash
+        run: |
+          # The bot has exactly one command; everything else is a button.
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setMyCommands" \
+            -H 'Content-Type: application/json' \
+            -d '{"commands":[{"command":"arena","description":"Выйти на арену"}]}'
+          echo
+
+      - name: Check group privacy mode
+        shell: bash
+        run: |
+          # With privacy ON, Telegram never delivers plain group text to the bot,
+          # so taps on the bottom "Выйти на арену" keyboard never arrive.
+          ME=$(curl -s "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/getMe")
+          if echo "$ME" | grep -q '"can_read_all_group_messages":true'; then
+            echo "Group privacy is DISABLED — the bottom keyboard button works."
+          else
+            echo "::warning::Group privacy is ENABLED. Taps on the bottom keyboard button will not reach the bot. Disable it: @BotFather -> /setprivacy -> your bot -> Disable. Inline buttons work regardless."
+          fi
