@@ -30,7 +30,7 @@
   <div class="sub">Живой показ боя тем же рендером, что генерирует GIF для Telegram. Проглотится <code>?battle=&lt;base64url JSON&gt;</code>.</div>
 
   <div class="panel">
-    <canvas id="cv" width="128" height="96"></canvas>
+    <canvas id="cv" width="136" height="102"></canvas>
     <div class="row">
       <button id="btnRandom" class="primary">🎲 Случайный бой</button>
       <button id="btnPlay">⏸ Пауза</button>
@@ -42,6 +42,8 @@
       <span>Бой: <b id="dur">–</b></span>
       <span>Победитель: <b id="winner">–</b></span>
       <span>Скорость: <b id="speed">1×</b></span>
+      <span>Кадры: <b id="framesInfo">–</b></span>
+      <span>Анимации: <b id="animInfo">–</b></span>
     </div>
     <div class="events" id="events"></div>
   </div>
@@ -63,6 +65,8 @@ const frameLabel = document.getElementById('frameLabel');
 const durEl = document.getElementById('dur');
 const winnerEl = document.getElementById('winner');
 const speedEl = document.getElementById('speed');
+const framesInfoEl = document.getElementById('framesInfo');
+const animInfoEl = document.getElementById('animInfo');
 const eventsEl = document.getElementById('events');
 const jsonBox = document.getElementById('jsonBox');
 const btnRandom = document.getElementById('btnRandom');
@@ -110,9 +114,15 @@ function load(battleJson, label) {
   };
   slider.max = Math.max(0, r.frames.length - 1);
   cv.width = r.width; cv.height = r.height;
-  durEl.textContent = `${state.battle.duration.toFixed(2)} s → видео ${(r.frames.length / FREE_PROFILE.fps).toFixed(2)} s`;
-  winnerEl.textContent = state.battle.fighters[state.battle.winner].name;
+  durEl.textContent = `${state.battle.duration.toFixed(2)} s → GIF ${(r.frames.length / FREE_PROFILE.fps).toFixed(2)} s`;
+  winnerEl.textContent = state.battle.winner
+    ? state.battle.fighters[state.battle.winner].name
+    : '(никто — лимит времени)';
   speedEl.textContent = '1×';
+  framesInfoEl.textContent = `${r.frames.length} @ ${FREE_PROFILE.fps} fps, ${r.width}×${r.height}`;
+  animInfoEl.textContent = `${r.timeline.beats}/${r.timeline.totalBeats} разменов,`
+    + ` пауза ${Math.round(r.timeline.idleCap * FREE_PROFILE.fps)} кадр.,`
+    + ` удары ×${r.timeline.attackScale.toFixed(2)}`;
 
   const ev = state.battle.events.filter(e => e.type !== 'end');
   eventsEl.textContent = ev.map(e => {

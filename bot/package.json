@@ -8,7 +8,10 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test": "vitest run",
-    "bench": "node test/bench.mjs"
+    "bench": "node test/sweep.mjs",
+    "cost": "node test/cost.mjs",
+    "verify": "node test/verify.mjs",
+    "poses": "node test/poses.mjs"
   },
   "dependencies": {
     "gifenc": "^1.0.3"

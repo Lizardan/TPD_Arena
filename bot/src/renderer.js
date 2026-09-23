@@ -1,130 +1,423 @@
-import { simulateBattle, ATTACK_DUR } from './battle.js';
+/**
+ * Battle scene renderer: builds the indexed GIF frames for one battle.
+ *
+ * Per frame: background blit (with screen shake) -> fighters -> impact FX ->
+ * HUD. The background is rasterised once and blitted into every frame, so the
+ * per-frame cost is dominated by the two fighters.
+ */
+
+import { simulateBattle } from './battle.js';
 import { drawTextCentered, measureText } from './font.js';
+import { C, buildPalette, hexToRgb } from './palette.js';
+import { rect, ellipse, circle, line, triangle, dome } from './draw.js';
+import { computeFighterState, drawFighter, pickWeapon, impactsNear, FIG } from './fighter.js';
+import { buildTimeline } from './timeline.js';
 
+/**
+ * Rendering profile tuned for the Cloudflare Workers free tier (~10 ms CPU per
+ * request). 136x102 at 12 fps with up to 36 frames.
+ *
+ * Two things matter for the "jerky / low FPS" look the original profile had:
+ *
+ *   - frame rate and how many frames a swing gets. The original ran 128x96 at
+ *     8 fps with 20 frames, so a 0.35 s attack landed on a single frame. Here a
+ *     swing spans 5-6 frames.
+ *   - how the battle is fitted into the budget. Compressing every exchange made
+ *     long fights collapse again; the timeline now shows a spread of exchanges
+ *     at full length instead (see timeline.js).
+ *
+ * Frame count is the dominant CPU lever, because gifenc visits every pixel of
+ * every frame whether or not it changed. 36 frames keeps the worst case of the
+ * bot's own stat ranges near 8 ms, leaving room for the webhook work around it.
+ * Raising maxFrames buys one more exchange per ~9 frames and costs ~1 ms each.
+ */
 export const FREE_PROFILE = {
-  width: 128,
-  height: 96,
-  fps: 8,
-  maxDuration: 2.5,
-  maxFrames: 20,
-  holdAfter: 0.4,
-  floorHeight: 14,
+  width: 136,
+  height: 102,
+  fps: 12,
+  maxFrames: 36,
+  holdAfter: 0.3,
+  floorHeight: 17,
+  shakeDur: 0.18,
 };
 
-const PAL = {
-  sky0: 0, sky1: 1, sky2: 2,
-  floorLine: 3,
-  shadow: 4,
-  hpBg: 5, hpGreen: 6, hpYellow: 7, hpRed: 8,
-  white: 9, damage: 10,
-  bodyL: 11, bodyLShade: 12, bodyLLight: 13,
-  bodyR: 14, bodyRShade: 15, bodyRLight: 16,
-};
+export { hexToRgb };
 
-const DEFAULT_LEFT = [255, 155, 61];
-const DEFAULT_RIGHT = [77, 166, 255];
+const NAME_SCALE_MAX = 2;
+const NAME_MAX_LINES = 2;
 
-const HIT_FLASH = 0.16;
-const POPUP_DUR = 0.7;
-const ARM_BASE = 4;
-const ARM_EXT_MAX = 8;
-const LUNGE_MAX = 6;
-const NAME_SCALE = 2;
-const MAX_NAME_W = 48;
+/* ------------------------------------------------------------------ */
+/* Background                                                          */
+/* ------------------------------------------------------------------ */
 
-export function hexToRgb(hex) {
-  if (typeof hex !== 'string') return null;
-  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
-  if (!m) return null;
-  const v = parseInt(m[1], 16);
-  return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
-}
+/** Deterministic star field, rasterised once. */
+const STARS = [
+  [0.06, 0.12], [0.14, 0.28], [0.21, 0.08], [0.29, 0.2], [0.36, 0.05],
+  [0.44, 0.24], [0.51, 0.1], [0.58, 0.3], [0.66, 0.14], [0.73, 0.06],
+  [0.8, 0.26], [0.87, 0.11], [0.93, 0.22], [0.97, 0.07], [0.11, 0.36],
+  [0.4, 0.34], [0.62, 0.38], [0.83, 0.35],
+];
 
-function shade(rgb, f) {
-  return [
-    Math.min(255, Math.round(rgb[0] * f)),
-    Math.min(255, Math.round(rgb[1] * f)),
-    Math.min(255, Math.round(rgb[2] * f)),
-  ];
-}
+function renderBackground(w, h, floorY, horizon) {
+  const buf = new Uint8Array(w * h);
 
-function buildPalette(leftColor, rightColor) {
-  const palette = [
-    [14, 16, 28],
-    [21, 23, 40],
-    [30, 33, 54],
-    [150, 152, 180],
-    [8, 8, 12],
-    [10, 10, 16],
-    [82, 205, 92],
-    [235, 205, 70],
-    [225, 72, 72],
-    [242, 242, 248],
-    [255, 215, 92],
-  ];
-  for (const base of [leftColor || DEFAULT_LEFT, rightColor || DEFAULT_RIGHT]) {
-    palette.push(base, shade(base, 0.6), shade(base, 1.45));
+  /* --- Night sky --- */
+  const bands = [C.sky0, C.sky1, C.sky2, C.sky3];
+  for (let i = 0; i < bands.length; i++) {
+    const y0 = Math.floor((horizon * i) / bands.length);
+    const y1 = Math.floor((horizon * (i + 1)) / bands.length);
+    buf.fill(bands[i], y0 * w, y1 * w);
   }
-  return palette;
-}
-
-function fillRect(buf, w, h, x, y, rw, rh, color) {
-  const x0 = Math.max(0, Math.floor(x));
-  const y0 = Math.max(0, Math.floor(y));
-  const x1 = Math.min(w, Math.floor(x + rw));
-  const y1 = Math.min(h, Math.floor(y + rh));
-  for (let py = y0; py < y1; py++) {
-    buf.fill(color, py * w + x0, py * w + x1);
+  for (const [sx, sy] of STARS) {
+    const px = Math.round(sx * w);
+    const py = Math.round(sy * horizon);
+    buf[py * w + px] = C.white;
   }
+  // Moon with a soft halo.
+  const mx = Math.round(w * 0.82);
+  const my = Math.round(horizon * 0.24);
+  circle(buf, w, h, mx, my, 9, C.sky3);
+  circle(buf, w, h, mx, my, 7, C.hpGhost);
+  circle(buf, w, h, mx - 2, my - 2, 2, C.sky2);
+  circle(buf, w, h, mx + 3, my + 2, 1.5, C.sky2);
+
+  /* --- Arena wall --- */
+  const wallTop = horizon;
+  rect(buf, w, h, 0, wallTop, w, floorY - wallTop, C.wall);
+  // Stone courses.
+  for (let y = wallTop + 6; y < floorY; y += 7) {
+    rect(buf, w, h, 0, y, w, 1, C.wallLight);
+  }
+  // Vertical joints, offset per course so it reads as masonry.
+  for (let y = wallTop + 6, row = 0; y < floorY; y += 7, row++) {
+    const off = row % 2 === 0 ? 0 : 9;
+    for (let x = off; x < w; x += 18) {
+      rect(buf, w, h, x, y, 1, Math.min(7, floorY - y), C.wallLight);
+    }
+  }
+  // Parapet with merlons.
+  rect(buf, w, h, 0, wallTop - 4, w, 4, C.wallLight);
+  for (let x = 2; x < w; x += 12) {
+    rect(buf, w, h, x, wallTop - 8, 7, 5, C.wallLight);
+    rect(buf, w, h, x, wallTop - 8, 7, 1, C.sky3);
+  }
+  // Arched gateways at the sides, lit faintly from the torches inside.
+  for (const ax of [0.13, 0.87]) {
+    const gx = Math.round(ax * w);
+    const gw = 17;
+    const gh = 20;
+    rect(buf, w, h, gx - gw / 2, floorY - gh, gw, gh, C.outline);
+    dome(buf, w, h, gx, floorY - gh, gw / 2, gw / 2 + 2, C.outline);
+    rect(buf, w, h, gx - gw / 2 + 2, floorY - gh + 3, gw - 4, gh - 3, C.sky0);
+    dome(buf, w, h, gx, floorY - gh + 2, gw / 2 - 2, gw / 2 - 1, C.sky0);
+    rect(buf, w, h, gx - gw / 2 + 2, floorY - gh + 3, gw - 4, 4, C.sky1);
+    dome(buf, w, h, gx, floorY - gh + 2, gw / 2 - 2, gw / 2 - 1, C.sky1);
+  }
+  // Narrow arrow slits along the wall.
+  for (const sx of [0.3, 0.42, 0.58, 0.7]) {
+    const gx = Math.round(sx * w);
+    rect(buf, w, h, gx - 1, wallTop + 12, 3, 9, C.outline);
+    rect(buf, w, h, gx, wallTop + 13, 1, 7, C.sky1);
+  }
+  // Torches on the wall.
+  for (const tx of [0.11, 0.39, 0.61, 0.89]) {
+    const gx = Math.round(tx * w);
+    const gy = wallTop + 10;
+    rect(buf, w, h, gx, gy, 2, 7, C.woodShade);
+    rect(buf, w, h, gx - 2, gy + 7, 6, 2, C.metalShade);
+    circle(buf, w, h, gx + 1, gy - 2, 3, C.damage);
+    circle(buf, w, h, gx + 1, gy - 3, 1.6, C.spark);
+  }
+
+  /* --- Sand floor --- */
+  rect(buf, w, h, 0, floorY, w, h - floorY, C.floor0);
+  rect(buf, w, h, 0, floorY, w, 2, C.floorLine);
+  rect(buf, w, h, 0, floorY + 2, w, 1, C.floor1);
+  for (let i = 0; i < 60; i++) {
+    const gx = (i * 37 + 11) % w;
+    const gy = floorY + 3 + ((i * 53) % Math.max(1, h - floorY - 4));
+    buf[gy * w + gx] = C.floor1;
+  }
+  // A few flat stones for scale.
+  for (const [sx, sy, sw] of [[0.28, 0.55, 9], [0.68, 0.72, 12], [0.48, 0.35, 7]]) {
+    const gx = Math.round(sx * w);
+    const gy = floorY + Math.round(sy * (h - floorY));
+    rect(buf, w, h, gx, gy, sw, 2, C.floor1);
+    rect(buf, w, h, gx, gy, sw, 1, C.floorLine);
+  }
+
+  return buf;
 }
 
-function fillCircle(buf, w, h, cx, cy, r, color) {
-  const x0 = Math.max(0, Math.floor(cx - r));
-  const x1 = Math.min(w - 1, Math.ceil(cx + r));
-  const y0 = Math.max(0, Math.floor(cy - r));
-  const y1 = Math.min(h - 1, Math.ceil(cy + r));
-  const r2 = r * r;
-  for (let py = y0; py <= y1; py++) {
-    const dy = py - cy;
-    for (let px = x0; px <= x1; px++) {
-      const dx = px - cx;
-      if (dx * dx + dy * dy <= r2) buf[py * w + px] = color;
+/** Copies the background into a frame with a pixel offset (screen shake). */
+function blit(buf, bg, w, h, dx, dy) {
+  if (dx === 0 && dy === 0) {
+    buf.set(bg);
+    return;
+  }
+  for (let y = 0; y < h; y++) {
+    const sy = y - dy;
+    if (sy < 0 || sy >= h) continue;
+    const src = bg.subarray(sy * w, sy * w + w);
+    const dstStart = y * w;
+    if (dx === 0) {
+      buf.set(src, dstStart);
+    } else if (dx > 0) {
+      buf.set(src.subarray(0, w - dx), dstStart + dx);
+      buf.fill(C.outline, dstStart, dstStart + dx);
+    } else {
+      buf.set(src.subarray(-dx), dstStart);
+      buf.fill(C.outline, dstStart + w + dx, dstStart + w);
     }
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Effects                                                             */
+/* ------------------------------------------------------------------ */
+
+const SPARK_DIRS = [
+  [1, 0], [0.5, -0.87], [-0.5, -0.87], [-1, 0], [-0.5, 0.87], [0.5, 0.87],
+  [0.87, -0.5], [-0.87, 0.5],
+];
+
+function drawSparks(buf, w, h, cx, cy, progress) {
+  const r = 2 + progress * 10;
+  const alpha = 1 - progress;
+  for (let i = 0; i < SPARK_DIRS.length; i++) {
+    const [ux, uy] = SPARK_DIRS[i];
+    const px = Math.round(cx + ux * r);
+    const py = Math.round(cy + uy * r * 0.85);
+    if (px < 0 || px >= w || py < 0 || py >= h) continue;
+    buf[py * w + px] = alpha > 0.45 ? C.spark : C.damage;
+    if (alpha > 0.6 && i % 2 === 0) {
+      const tx = Math.round(cx + ux * (r - 3));
+      const ty = Math.round(cy + uy * (r - 3) * 0.85);
+      if (tx >= 0 && tx < w && ty >= 0 && ty < h) buf[ty * w + tx] = C.damage;
+    }
+  }
+  if (progress < 0.35) {
+    circle(buf, w, h, cx, cy, 2.8 * (1 - progress / 0.35), C.white);
+  }
+}
+
+function drawDust(buf, w, h, cx, floorY, progress) {
+  if (progress < 0 || progress > 1) return;
+  const spread = 3 + progress * 8;
+  const fade = 1 - progress;
+  for (let i = 0; i < 6; i++) {
+    const ux = (i / 5) * 2 - 1;
+    const px = Math.round(cx + ux * spread);
+    const py = Math.round(floorY - 1 - progress * 4 + (i % 2));
+    if (px < 0 || px >= w || py < 0 || py >= h) continue;
+    buf[py * w + px] = fade > 0.4 ? C.dust : C.floorLine;
+  }
+}
+
+/** Text with a 1px dark outline so numbers stay readable on any background. */
+function drawTextOutlined(buf, w, h, str, cx, y, color, scale = 1) {
+  for (const [ox, oy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+    drawTextCentered(buf, w, h, str, cx + ox, y + oy, C.outline, scale);
+  }
+  drawTextCentered(buf, w, h, str, cx, y, color, scale);
+}
+
+/* ------------------------------------------------------------------ */
+/* HUD                                                                 */
+/* ------------------------------------------------------------------ */
+
+function wrapLabel(label, perLine, maxLines) {
+  if (perLine < 1) return null;
+  if (label.length <= perLine) return [label];
+  const lines = [];
+  let rest = label;
+  while (rest.length > 0) {
+    if (lines.length === maxLines) return null;
+    if (rest.length <= perLine) {
+      lines.push(rest);
+      break;
+    }
+    // Prefer breaking on a separator so nicknames stay readable.
+    let cut = -1;
+    for (let i = Math.min(perLine, rest.length - 1); i > Math.max(0, perLine - 5); i--) {
+      const ch = rest[i];
+      if (ch === ' ' || ch === '_' || ch === '-' || ch === '.') { cut = i + 1; break; }
+    }
+    if (cut <= 0) cut = perLine;
+    lines.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  return lines;
+}
+
 /**
- * Renders an animated battle as indexed GIF frames.
- * Returns { frames, palette, width, height, delayMs }.
+ * Fits a nickname into `maxW`.
+ *
+ * Preference order matters: a single line is always nicer than a wrap, so the
+ * large scale is only used when the name fits on one line; otherwise the small
+ * scale gets a chance before wrapping. Long Telegram nicknames therefore end up
+ * on two lines rather than running off the canvas or being chopped mid-word.
  */
+function layoutName(name, maxW) {
+  const label = String(name || '???').toUpperCase();
+  const attempts = [
+    [NAME_SCALE_MAX, 1],
+    [1, 1],
+    [NAME_SCALE_MAX, NAME_MAX_LINES],
+    [1, NAME_MAX_LINES],
+  ];
+  for (const [scale, maxLines] of attempts) {
+    const perLine = Math.floor((maxW + 1) / (4 * scale));
+    const lines = wrapLabel(label, perLine, maxLines);
+    if (lines) return { lines, scale };
+  }
+  // Nothing fits even at the smallest scale: truncate to the available space.
+  const perLine = Math.floor((maxW + 1) / 4);
+  const lines = wrapLabel(label.slice(0, perLine * NAME_MAX_LINES), perLine, NAME_MAX_LINES);
+  return { lines: lines || [label.slice(0, perLine)], scale: 1 };
+}
+
+/**
+ * Computes the name plate geometry without drawing it.
+ *
+ * The plate is centred over its own fighter but clamped into its half of the
+ * canvas, so two long nicknames can never overlap. Exported so the layout rules
+ * are directly testable.
+ */
+export function computeNameplateLayout(name, cx, halfSide, w, isLeft) {
+  const maxW = Math.max(20, Math.round(Math.abs(halfSide) - 12));
+  const { lines, scale } = layoutName(name, maxW);
+  const lineH = 5 * scale;
+  const lineGap = scale;
+  const blockH = lines.length * lineH + (lines.length - 1) * lineGap;
+  const widest = Math.max(...lines.map((l) => measureText(l) * scale));
+  const plateW = Math.min(w - 6, widest + 6);
+
+  const minCx = isLeft ? plateW / 2 + 2 : w / 2 + plateW / 2 + 2;
+  const maxCx = isLeft ? w / 2 - plateW / 2 - 2 : w - plateW / 2 - 2;
+  const plateCx = Math.max(minCx, Math.min(maxCx, cx));
+  const plateX = Math.round(plateCx - plateW / 2);
+
+  return { lines, scale, blockH, plateW, plateCx, plateX, maxW };
+}
+
+/**
+ * Name plate above the fighter. Uses the layout above and draws a dark plate
+ * with an accent stripe in the fighter's colour.
+ */
+function drawNameplate(buf, w, h, cx, halfSide, st, accent) {
+  const isLeft = accent.side === 'left';
+  const layout = computeNameplateLayout(st.name, cx, halfSide, w, isLeft);
+  const { lines, scale, blockH, plateW, plateCx, plateX } = layout;
+
+  const lineH = 5 * scale;
+  const lineGap = scale;
+  const headTop = st.floorY - FIG.legH - FIG.bodyH - FIG.neckH - FIG.headR * 2;
+  const barY = headTop - 12;
+  const nameBottom = barY - 4;
+  const plateTop = Math.round(nameBottom - blockH - 3);
+
+  rect(buf, w, h, plateX - 1, plateTop - 1, plateW + 2, blockH + 6, C.outline);
+  rect(buf, w, h, plateX, plateTop, plateW, blockH + 4, C.hpBg);
+  // Accent stripe in the fighter's colour ties the plate to its owner.
+  rect(buf, w, h, plateX, plateTop, plateW, 1, accent.color);
+
+  lines.forEach((line, i) => {
+    const y = nameBottom - (lines.length - i) * lineH - (lines.length - 1 - i) * lineGap;
+    drawTextCentered(buf, w, h, line, plateCx, y, C.white, scale);
+  });
+
+  return { barY };
+}
+
+function drawHealthBar(buf, w, h, cx, barY, st, accent) {
+  const barW = 42;
+  const barH = 5;
+  const bx = Math.round(cx - barW / 2);
+  const frac = st.maxHp > 0 ? Math.max(0, Math.min(1, st.hp / st.maxHp)) : 0;
+  const ghostFrac = st.maxHp > 0 ? Math.max(0, Math.min(1, st.ghostHp / st.maxHp)) : 0;
+
+  rect(buf, w, h, bx - 1, barY - 1, barW + 2, barH + 2, C.hpFrame);
+  rect(buf, w, h, bx, barY, barW, barH, C.hpBg);
+
+  const ghostW = Math.round(barW * ghostFrac);
+  if (ghostW > 0) rect(buf, w, h, bx, barY, ghostW, barH, C.hpGhost);
+
+  const fillW = Math.round(barW * frac);
+  if (fillW > 0) {
+    const color = frac > 0.5 ? C.hpGreen : frac > 0.25 ? C.hpYellow : C.hpRed;
+    rect(buf, w, h, bx, barY, fillW, barH, color);
+    // Subtle top highlight and bottom shade for a bit of depth.
+    rect(buf, w, h, bx, barY, fillW, 1, frac > 0.5 ? C.hpYellow : C.hpRed);
+    rect(buf, w, h, bx, barY + barH - 1, fillW, 1, C.hpFrame);
+  }
+
+  for (let i = 1; i < 4; i++) {
+    rect(buf, w, h, bx + Math.round((barW * i) / 4), barY, 1, barH, C.hpFrame);
+  }
+  // End caps in the owner's colour.
+  rect(buf, w, h, bx - 1, barY - 1, 1, barH + 2, accent.color);
+  rect(buf, w, h, bx + barW, barY - 1, 1, barH + 2, accent.color);
+}
+
+/* ------------------------------------------------------------------ */
+/* Main render                                                         */
+/* ------------------------------------------------------------------ */
+
+function screenShake(battle, simT, profile) {
+  let mag = 0;
+  for (const ev of impactsNear(battle, simT, profile.shakeDur)) {
+    const since = simT - ev.t;
+    if (since >= 0 && since < profile.shakeDur) {
+      mag = Math.max(mag, 1 - since / profile.shakeDur);
+    }
+  }
+  if (mag <= 0) return { x: 0, y: 0 };
+  const t = simT * 90;
+  return {
+    x: Math.round(Math.sin(t * 1.7) * mag * 1.8),
+    y: Math.round(Math.cos(t * 2.4) * mag * 1.1),
+  };
+}
+
 export function renderBattle(request, profile = FREE_PROFILE) {
   const battle = simulateBattle(request);
-  const { width, height, fps, maxDuration, maxFrames, holdAfter, floorHeight } = profile;
+  const { width, height, fps, floorHeight } = profile;
 
-  const colorL = hexToRgb((request.left && request.left.color) || null);
-  const colorR = hexToRgb((request.right && request.right.color) || null);
-  const palette = buildPalette(colorL, colorR);
+  const palette = buildPalette(
+    hexToRgb(request.left && request.left.color),
+    hexToRgb(request.right && request.right.color),
+  );
 
-  // Time mapping: the whole battle fits the GIF window.
-  let scale;
-  let gifDur;
-  if (battle.duration > maxDuration) {
-    scale = maxDuration / battle.duration;
-    gifDur = maxDuration;
-  } else {
-    scale = 1;
-    gifDur = Math.min(maxDuration, battle.duration + holdAfter);
-  }
-  let frames = Math.max(2, Math.ceil(gifDur * fps));
-  if (frames > maxFrames) {
-    frames = maxFrames;
-    scale = frames / fps / battle.duration;
-  }
+  const timeline = buildTimeline(battle, profile);
+  const framesCount = Math.max(2, Math.min(profile.maxFrames, timeline.frames));
+
+  const floorY = height - floorHeight;
+  const horizon = Math.max(28, floorY - 50);
+  const bg = renderBackground(width, height, floorY, horizon);
+
+  const weapons = {
+    left: pickWeapon(battle.fighters.left.name),
+    right: pickWeapon(battle.fighters.right.name),
+  };
+
+  const cxL = Math.round(width * 0.30);
+  const cxR = Math.round(width * 0.70);
+  const accents = {
+    left: { side: 'left', color: C.L_LIGHT },
+    right: { side: 'right', color: C.R_LIGHT },
+  };
+  const ramps = {
+    left: { base: C.L_BASE, dark: C.L_DARK, darker: C.L_DARKER, light: C.L_LIGHT, lighter: C.L_LIGHTER },
+    right: { base: C.R_BASE, dark: C.R_DARK, darker: C.R_DARKER, light: C.R_LIGHT, lighter: C.R_LIGHTER },
+  };
 
   const result = [];
-  for (let g = 0; g < frames; g++) {
-    const simT = g / (fps * scale);
-    result.push(renderFrame(width, height, floorHeight, battle, simT));
+  for (let g = 0; g < framesCount; g++) {
+    const simT = timeline.simAt(g / fps);
+    result.push(renderFrame({
+      width, height, floorY, battle, simT, bg, profile, weapons, cxL, cxR, ramps, accents,
+    }));
   }
 
   return {
@@ -134,182 +427,85 @@ export function renderBattle(request, profile = FREE_PROFILE) {
     height,
     delayMs: Math.round(1000 / fps),
     simSeconds: battle.duration,
-    framesCount: frames,
+    framesCount,
+    timeline: {
+      gifSeconds: timeline.gifDuration,
+      attackScale: timeline.attackScale,
+      idleCap: timeline.idleCap,
+      beats: timeline.beats,
+      totalBeats: timeline.totalBeats,
+      segments: timeline.segments,
+      simAt: timeline.simAt,
+    },
   };
 }
 
-function renderFrame(w, h, floorHeight, battle, simT) {
+function renderFrame(ctx) {
+  const {
+    width: w, height: h, floorY, battle, simT, bg, profile,
+    weapons, cxL, cxR, ramps, accents,
+  } = ctx;
   const buf = new Uint8Array(w * h);
-  const floorY = h - floorHeight;
-  const fy = floorY - 1;
 
-  // Background sky bands.
-  const bandH = Math.floor(fy / 3);
-  buf.fill(PAL.sky0, 0, bandH * w);
-  buf.fill(PAL.sky1, bandH * w, bandH * 2 * w);
-  buf.fill(PAL.sky2, bandH * 2 * w, fy * w);
+  const shake = screenShake(battle, simT, profile);
+  blit(buf, bg, w, h, shake.x, shake.y);
 
-  // Floor.
-  buf.fill(PAL.sky2, fy * w, floorY * w);
-  buf.fill(PAL.floorLine, floorY * w, floorY * w + w);
+  const stateL = computeFighterState(battle, 'left', simT);
+  const stateR = computeFighterState(battle, 'right', simT);
+  stateL.floorY = floorY;
+  stateR.floorY = floorY;
 
-  const cxL = Math.round(w * 0.3);
-  const cxR = Math.round(w * 0.7);
+  // Dust kicked up while lunging.
+  for (const st of [stateL, stateR]) {
+    if (st.mode === 'attack' && st.attackP > 0.3 && st.attackP < 0.75) {
+      const p = (st.attackP - 0.3) / 0.45;
+      const cx = st.side === 'left' ? cxL : cxR;
+      const dir = st.side === 'left' ? 1 : -1;
+      drawDust(buf, w, h, cx - dir * 9, floorY, p);
+    }
+  }
 
-  const stateL = fighterState(battle, 'left', simT);
-  const stateR = fighterState(battle, 'right', simT);
+  // The attacker is drawn last so the lunge overlaps the opponent.
+  const drawOrder = stateL.mode === 'attack' ? ['right', 'left'] : ['left', 'right'];
+  for (const side of drawOrder) {
+    const st = side === 'left' ? stateL : stateR;
+    const cx = side === 'left' ? cxL : cxR;
+    const face = side === 'left' ? 1 : -1;
+    drawFighter(buf, w, h, floorY, cx, face, st, ramps[side], weapons[side]);
+  }
 
-  drawFighter(buf, w, h, fy, cxL, 1, stateL, PAL.bodyL, PAL.bodyLShade, PAL.bodyLLight);
-  drawFighter(buf, w, h, fy, cxR, -1, stateR, PAL.bodyR, PAL.bodyRShade, PAL.bodyRLight);
+  drawImpactEffects(buf, w, h, battle, simT, floorY, cxL, cxR);
+  drawDamagePopups(buf, w, h, battle, simT, floorY, cxL, cxR);
 
-  drawHud(buf, w, h, fy, cxL, stateL, battle, 'left');
-  drawHud(buf, w, h, fy, cxR, stateR, battle, 'right');
-
-  drawPopups(buf, w, h, fy, battle, simT, cxL, cxR);
+  const plateL = drawNameplate(buf, w, h, cxL, cxR - cxL, stateL, accents.left);
+  const plateR = drawNameplate(buf, w, h, cxR, cxR - cxL, stateR, accents.right);
+  drawHealthBar(buf, w, h, cxL, plateL.barY, stateL, accents.left);
+  drawHealthBar(buf, w, h, cxR, plateR.barY, stateR, accents.right);
 
   return buf;
 }
 
-function fighterState(battle, side, simT) {
-  const st = {
-    side,
-    hp: battle.fighters[side].hp,
-    maxHp: battle.fighters[side].hp,
-    dead: false,
-    attackP: -1,
-    attackT: 0,
-    hitFlash: 0,
-    hitFloat: 0,
-    damagedRecently: false,
-    popupT: -1,
-  };
-  for (const ev of battle.events) {
-    if (ev.t > simT) break;
-    if (ev.type === 'impact' && ev.target === side) {
-      st.hp = ev.hpAfter;
-      st.popupT = ev.t;
-      const since = simT - ev.t;
-      if (since >= 0 && since < HIT_FLASH) {
-        st.hitFlash = 1 - since / HIT_FLASH;
-        st.hitFloat = Math.round((1 - since / HIT_FLASH) * 2);
-        st.damagedRecently = true;
-      }
-    }
-    if (ev.type === 'death' && ev.who === side) {
-      st.dead = true;
-      st.deadT = ev.t;
-    }
-    if (ev.type === 'attack' && ev.who === side) {
-      st.attackT = ev.t;
-      const since = simT - ev.t;
-      if (since >= 0 && since < ATTACK_DUR) st.attackP = since / ATTACK_DUR;
-    }
-  }
-  return st;
-}
-
-function drawFighter(buf, w, h, fy, cx, face, st, body, bodyShade, bodyLight) {
-  const legH = 4;
-  const torsH = 14;
-  const torsW = 12;
-  const headR = 5;
-
-  const bob = st.dead ? 0 : Math.round(Math.sin(st.attackT * Math.PI * 2 * 0.8) * 1);
-
-  let lunge = 0;
-  let armLen = ARM_BASE;
-  if (st.attackP >= 0 && st.attackP <= 1) {
-    const k = Math.sin(st.attackP * Math.PI);
-    lunge = Math.round(k * LUNGE_MAX);
-    armLen = ARM_BASE + Math.round(k * ARM_EXT_MAX);
-  }
-  if (st.hitFloat > 0) lunge -= Math.round(st.hitFloat * 2) * face;
-
-  const baseY = fy - bob;
-
-  fillRect(buf, w, h, cx - 7, fy - 1, 14, 1, PAL.shadow);
-
-  if (st.dead) {
-    const layY = baseY - 5;
-    fillRect(buf, w, h, Math.min(cx, cx + face * 12), layY, 12, 5, bodyShade);
-    fillCircle(buf, w, h, cx + face * 15, layY + 2, 3, bodyShade);
-    return;
-  }
-
-  const bodyTopY = baseY - legH - torsH;
-  const headCy = bodyTopY - headR + 1;
-  const bodyColor = st.hitFlash > 0 ? bodyLight : body;
-  const headColor = st.hitFlash > 0 ? PAL.white : body;
-
-  // Legs.
-  fillRect(buf, w, h, cx - 4, baseY - legH, 3, legH, bodyShade);
-  fillRect(buf, w, h, cx + 1, baseY - legH, 3, legH, bodyShade);
-
-  // Torso.
-  const tx = cx - torsW / 2 + lunge;
-  fillRect(buf, w, h, tx, bodyTopY, torsW, torsH, bodyColor);
-  // Back strip.
-  const stripX = face === 1 ? tx + torsW - 3 : tx;
-  fillRect(buf, w, h, stripX, bodyTopY, 3, torsH, bodyShade);
-
-  // Arm toward the opponent.
-  const shoulderY = bodyTopY + 4;
-  const sx = face === 1 ? cx + torsW / 2 - 2 + lunge : cx - torsW / 2 + 2 + lunge;
-  const armX = face === 1 ? sx - 1 : sx - armLen + 1;
-  fillRect(buf, w, h, armX, shoulderY - 1, armLen + 2, 2, bodyShade);
-  fillRect(buf, w, h, armX, shoulderY, armLen, 2, bodyColor);
-
-  // Head.
-  fillCircle(buf, w, h, cx + lunge, headCy, headR, headColor);
-}
-
-function drawHud(buf, w, h, fy, cx, st, battle, side) {
-  const headTop = fy - 4 - 14 - 5 - 5 + 1;
-  const barY = headTop - 7;
-  const nameY = barY - 10;
-  const barW = 24;
-  const frac = st.maxHp > 0 ? st.hp / st.maxHp : 0;
-
-  let label = (battle.fighters[side].name || '???').toUpperCase();
-  while (label.length > 1 && measureText(label) * NAME_SCALE > MAX_NAME_W) {
-    label = label.slice(0, -1);
-  }
-
-  // Dark pill behind the name so it stays readable over the sky.
-  const tw = Math.round(measureText(label) * NAME_SCALE / 2);
-  fillRect(buf, w, h, cx - tw - 2, nameY - 1, tw * 2 + 4, 12, PAL.shadow);
-  drawTextCentered(buf, w, h, label, cx, nameY, PAL.white, NAME_SCALE);
-
-  const bx = cx - barW / 2;
-  fillRect(buf, w, h, bx, barY + 1, barW, 3, PAL.hpBg);
-  const fillW = Math.round(barW * Math.min(1, Math.max(0, frac)));
-  if (fillW > 0) {
-    const color = frac > 0.5 ? PAL.hpGreen : frac > 0.25 ? PAL.hpYellow : PAL.hpRed;
-    fillRect(buf, w, h, bx, barY + 1, fillW, 2, color);
-  }
-}
-
-function drawPopups(buf, w, h, fy, battle, simT, cxL, cxR) {
-  const baseY = fy - 27 - 10;
-  for (const ev of battle.events) {
-    if (ev.type !== 'impact') continue;
+function drawImpactEffects(buf, w, h, battle, simT, floorY, cxL, cxR) {
+  for (const ev of impactsNear(battle, simT, 0.3)) {
     const since = simT - ev.t;
-    if (since < 0.08 || since > POPUP_DUR) continue;
-    // Actually draw the full popup from the moment of impact; we need to include
-    // the first frames. If since < 0 skip entirely (handled below).
-    const centerX = ev.target === 'left' ? cxL : cxR;
-    const p = (since - 0.08) / (POPUP_DUR - 0.08);
-    const y = baseY - Math.round((since / POPUP_DUR) * 12);
-    drawTextCentered(buf, w, h, String(ev.damage), centerX, y, PAL.damage, 1);
-
-    // Impact spark inside the victim.
-    if (since < 0.18) drawSpark(buf, w, h, centerX, fy - 23, 1 - since / 0.18);
+    if (since < 0 || since > 0.3) continue;
+    const cx = ev.target === 'left' ? cxL : cxR;
+    const cy = floorY - FIG.legH - FIG.bodyH * 0.6;
+    drawSparks(buf, w, h, cx, cy, since / 0.3);
   }
 }
 
-function drawSpark(buf, w, h, cx, cy, strength) {
-  const len = 3;
-  buf[Math.min(h - 1, Math.max(0, cy)) * w + Math.min(w - 1, Math.max(0, cx))] = PAL.white;
-  fillRect(buf, w, h, cx - len, cy, len * 2 + 1, 1, PAL.white);
-  fillRect(buf, w, h, cx, cy - len, 1, len * 2 + 1, PAL.white);
+function drawDamagePopups(buf, w, h, battle, simT, floorY, cxL, cxR) {
+  const POPUP_DUR = 0.75;
+  const baseY = floorY - FIG.legH - FIG.bodyH - FIG.neckH - FIG.headR * 2 - 4;
+  for (const ev of impactsNear(battle, simT, POPUP_DUR)) {
+    const since = simT - ev.t;
+    if (since < 0 || since > POPUP_DUR) continue;
+    const t = since / POPUP_DUR;
+    const dir = ev.target === 'left' ? 1 : -1;
+    const cx = (ev.target === 'left' ? cxL : cxR) + dir * 12;
+    const y = baseY - Math.round(t * 12);
+    const scale = since < 0.09 ? 2 : 1;
+    drawTextOutlined(buf, w, h, String(ev.damage), cx, y, C.damage, scale);
+  }
 }
