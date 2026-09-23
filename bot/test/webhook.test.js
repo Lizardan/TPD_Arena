@@ -185,8 +185,11 @@ describe('command menu', () => {
     vi.restoreAllMocks();
   });
 
-  it('exposes a single command — arena', () => {
-    expect(internals.BOT_COMMANDS).toEqual([{ command: 'arena', description: 'Выйти на арену' }]);
+  it('exposes arena and stop in the menu', () => {
+    expect(internals.BOT_COMMANDS).toEqual([
+      { command: 'arena', description: 'Выйти на арену' },
+      { command: 'stop', description: 'Офнуть все арены в чате' },
+    ]);
   });
 
   it('registers the menu once per worker instance', async () => {
@@ -240,54 +243,91 @@ describe('bottom keyboard', () => {
     expect(arenaCardCall(calls)).toBeDefined();
   });
 
-  it('styles the arena card buttons', async () => {
+  it('keeps the arena card to a single call to action', async () => {
     const { env } = makeEnv();
     const calls = mockTelegram();
     await internals.handleMessage(env, messageUpdate('/arena', creatorId));
 
     const rows = arenaCardCall(calls).body.reply_markup.inline_keyboard;
-    expect(rows).toHaveLength(2);
+    expect(rows).toHaveLength(1);
     expect(rows[0][0].style).toBe('success');
-    expect(rows[1][0].style).toBe('danger');
-    expect(rows[1][0].text).toMatch(/Офнуть все арены/);
-    expect(rows[1][0].callback_data).toBe(`o|${chatId}`);
+    expect(rows[0][0].callback_data).toMatch(/^a\|/);
   });
 });
 
-describe('off all arenas', () => {
+describe('/stop closes every arena in the chat', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
   });
 
-  it('cancels the pending arena and strips the buttons', async () => {
+  it('cancels the pending arena and strips the card button', async () => {
     const { env, kv } = makeEnv();
     const calls = mockTelegram();
     await internals.handleMessage(env, messageUpdate('/arena', creatorId));
-
-    const offData = arenaCardCall(calls).body.reply_markup.inline_keyboard[1][0].callback_data;
     calls.length = 0;
 
-    await internals.handleCallback(env, callbackUpdate(offData, joinerId));
+    await internals.handleMessage(env, messageUpdate('/stop', joinerId));
 
-    expect(lastByMethod(calls, 'answerCallbackQuery').body.text).toMatch(/закрыты/);
+    expect(kv.map.has(arenaKey(chatId))).toBe(false);
     const edit = lastByMethod(calls, 'editMessageText');
     expect(edit.body.text).toMatch(/АРЕНЫ ЗАКРЫТЫ/);
     expect(edit.body.reply_markup.inline_keyboard).toHaveLength(0);
-    expect(kv.map.has(arenaKey(chatId))).toBe(false);
+    expect(lastByMethod(calls, 'sendMessage').body.text).toMatch(/закрыты/);
     // Nobody joined, so no fight was started.
     expect(calls.filter((c) => c.method === 'sendAnimation')).toHaveLength(0);
   });
 
-  it('lets the creator cancel their own arena too', async () => {
+  it('lets the creator stop their own arena too', async () => {
     const { env, kv } = makeEnv();
     const calls = mockTelegram();
     await internals.handleMessage(env, messageUpdate('/arena', creatorId));
-    const offData = arenaCardCall(calls).body.reply_markup.inline_keyboard[1][0].callback_data;
     calls.length = 0;
 
-    await internals.handleCallback(env, callbackUpdate(offData, creatorId));
+    await internals.handleMessage(env, messageUpdate('/stop', creatorId));
+
+    expect(kv.map.has(arenaKey(chatId))).toBe(false);
+    expect(lastByMethod(calls, 'sendMessage').body.text).toMatch(/закрыты/);
+  });
+
+  it('reports an empty chat instead of failing', async () => {
+    const { env } = makeEnv();
+    const calls = mockTelegram();
+    await internals.handleMessage(env, messageUpdate('/stop', creatorId));
+    expect(lastByMethod(calls, 'sendMessage').body.text).toMatch(/нет активных арен/);
+    expect(calls.filter((c) => c.method === 'editMessageText')).toHaveLength(0);
+  });
+
+  it('tells the user /stop works only in groups', async () => {
+    const { env } = makeEnv();
+    const calls = mockTelegram();
+    await internals.handleMessage(env, messageUpdate('/stop', creatorId, 'private'));
+    expect(lastByMethod(calls, 'sendMessage').body.text).toMatch(/только в групповых чатах/);
+  });
+
+  it('recognises stop command variants', () => {
+    for (const t of ['/stop', '/стоп', '/stop@MyBot', 'стоп']) {
+      expect(internals.isStopCommand(t)).toBe(true);
+    }
+    expect(internals.isStopCommand('/arena')).toBe(false);
+    expect(internals.isStopCommand('/stopwatch')).toBe(false);
+  });
+});
+
+describe('legacy off-all callback', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('still closes arenas from cards already sitting in chats', async () => {
+    const { env, kv } = makeEnv();
+    const calls = mockTelegram();
+    await internals.handleMessage(env, messageUpdate('/arena', creatorId));
+    calls.length = 0;
+
+    await internals.handleCallback(env, callbackUpdate(`o|${chatId}`, joinerId));
 
     expect(lastByMethod(calls, 'answerCallbackQuery').body.text).toMatch(/закрыты/);
+    expect(lastByMethod(calls, 'editMessageText').body.reply_markup.inline_keyboard).toHaveLength(0);
     expect(kv.map.has(arenaKey(chatId))).toBe(false);
   });
 

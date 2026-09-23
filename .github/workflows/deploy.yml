@@ -71,10 +71,13 @@ jobs:
       - name: Set bot commands
         shell: bash
         run: |
-          # The bot has exactly one command; everything else is a button.
+          # /arena opens a fight, /stop closes every pending arena in the chat.
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setMyCommands" \
             -H 'Content-Type: application/json' \
-            -d '{"commands":[{"command":"arena","description":"Выйти на арену"}]}'
+            -d '{"commands":[
+                  {"command":"arena","description":"Выйти на арену"},
+                  {"command":"stop","description":"Офнуть все арены в чате"}
+                ]}'
           echo
 
       - name: Check group privacy mode

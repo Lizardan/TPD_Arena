@@ -15,10 +15,14 @@ import {
 const COLORS = ['#ff9b3d', '#4da6ff', '#e74c3c', '#2ecc71', '#9b59b6', '#f1c40f', '#1abc9c', '#e67e22'];
 
 /**
- * The only command in the bot menu. Everything else the user needs is a button.
- * Applied by CI on deploy and re-applied lazily by the worker (see syncCommands).
+ * The bot menu. `/arena` opens a fight, `/stop` closes every pending arena in
+ * the chat. Applied by CI on deploy and re-applied lazily by the worker
+ * (see syncCommands).
  */
-const BOT_COMMANDS = [{ command: 'arena', description: 'Выйти на арену' }];
+const BOT_COMMANDS = [
+  { command: 'arena', description: 'Выйти на арену' },
+  { command: 'stop', description: 'Офнуть все арены в чате' },
+];
 
 /** Label of the persistent bottom keyboard button. Pressing it sends this text. */
 const ARENA_BUTTON = '⚔️ Выйти на арену';
@@ -80,14 +84,23 @@ function normalizeText(text) {
 }
 
 const ARENA_WORDS = ['arena', 'арена'];
+const STOP_WORDS = ['stop', 'стоп'];
 const BUTTON_WORD = normalizeText(ARENA_BUTTON); // 'выйти на арену'
+
+/** Matches `word`, `word@BotName` — anything else about the text is already stripped. */
+function matchesWords(t, words) {
+  if (!t) return false;
+  if (words.includes(t)) return true;
+  return words.some((w) => t.startsWith(`${w}@`));
+}
 
 function isArenaCommand(text) {
   const t = normalizeText(text);
-  if (!t) return false;
-  if (ARENA_WORDS.includes(t)) return true;
-  if (ARENA_WORDS.some((w) => t.startsWith(`${w}@`))) return true;
-  return t === BUTTON_WORD;
+  return t === BUTTON_WORD || matchesWords(t, ARENA_WORDS);
+}
+
+function isStopCommand(text) {
+  return matchesWords(normalizeText(text), STOP_WORDS);
 }
 
 function arenaText(arena) {
@@ -128,7 +141,8 @@ function offAllText(from) {
 }
 
 /**
- * Inline buttons on the arena card.
+ * Inline button on the arena card — the only one. Closing the arena lives in
+ * the `/stop` command, so the card stays a single clear call to action.
  *
  * `style` colours the button (blue/green/red) in Telegram clients released
  * after 9 Feb 2026; older clients simply render it unstyled. Custom emoji icons
@@ -143,13 +157,6 @@ function arenaCard(arena) {
           text: `⚔️ Выйти против ${shortName(arena.left.name)}`,
           callback_data: `a|${arena.chatId}|${arena.id}`,
           style: 'success',
-        },
-      ],
-      [
-        {
-          text: '🛑 Офнуть все арены в чате',
-          callback_data: `o|${arena.chatId}`,
-          style: 'danger',
         },
       ],
     ],
@@ -261,10 +268,11 @@ async function handleMessage(env, update) {
   const bot = createTelegram(env);
   const msg = update.message;
   const text = msg.text || '';
+  const chatId = msg.chat.id;
 
+  if (isStopCommand(text)) return handleStop(env, bot, msg);
   if (!isArenaCommand(text)) return;
 
-  const chatId = msg.chat.id;
   if (msg.chat.type === 'private') {
     await bot.sendMessage(chatId, '⚔️ Команда /arena работает только в групповых чатах.');
     return;
@@ -304,6 +312,38 @@ async function handleMessage(env, update) {
       .catch(() => null);
     if (sent && sent.ok) await saveMenu(env, chatId);
   }
+}
+
+/**
+ * Cancels every pending arena in the chat and marks its card as closed.
+ * Returns the closed arena, or null when there was nothing to close.
+ */
+async function closeArenas(env, bot, chatId, from, fallbackMessageId) {
+  const cancelled = await cancelArenas(env, chatId);
+  if (cancelled.length === 0) return null;
+
+  const arena = cancelled[0];
+  const messageId = arena.messageId || fallbackMessageId;
+  if (messageId) {
+    // editMessageText drops the inline keyboard by default, so the button goes away too.
+    await bot.editMessageText(chatId, messageId, offAllText(from)).catch(() => {});
+  }
+  return arena;
+}
+
+/** `/stop` — anyone in the chat may close the pending arena. */
+async function handleStop(env, bot, msg) {
+  const chatId = msg.chat.id;
+  if (msg.chat.type === 'private') {
+    await bot.sendMessage(chatId, '⚔️ Команда /stop работает только в групповых чатах.');
+    return;
+  }
+
+  const closed = await closeArenas(env, bot, chatId, msg.from);
+  await bot.sendMessage(
+    chatId,
+    closed ? '🛑 Арены в этом чате закрыты.' : 'В этом чате нет активных арен.',
+  ).catch(() => {});
 }
 
 async function handleCallback(env, update) {
@@ -347,7 +387,11 @@ async function handleCallback(env, update) {
   return processFight(env, chatId, existing.messageId, existing.left, existing.right);
 }
 
-/** Anyone in the chat may press "off all arenas" — whoever does, the arena closes. */
+/**
+ * Legacy handler for the `o|<chatId>` callback button that used to sit on the
+ * arena card. The button is gone, but cards already sitting in chats still carry
+ * it — answering them properly beats "сломанная кнопка".
+ */
 async function handleOffAll(bot, env, cq, chatId) {
   const msgChatId = cq.message && cq.message.chat ? cq.message.chat.id : chatId;
   if (msgChatId !== chatId) {
@@ -355,19 +399,9 @@ async function handleOffAll(bot, env, cq, chatId) {
     return;
   }
 
-  const cancelled = await cancelArenas(env, chatId);
-  if (cancelled.length === 0) {
-    await bot.answerCallbackQuery(cq.id, 'В этом чате нет активных арен');
-    return;
-  }
-
-  await bot.answerCallbackQuery(cq.id, 'Арены закрыты 🛑');
-
-  const messageId = cq.message && cq.message.message_id;
-  if (messageId) {
-    // editMessageText drops the inline keyboard by default, so the buttons go away too.
-    await bot.editMessageText(chatId, messageId, offAllText(cq.from)).catch(() => {});
-  }
+  const fallback = cq.message && cq.message.message_id;
+  const closed = await closeArenas(env, bot, chatId, cq.from, fallback);
+  await bot.answerCallbackQuery(cq.id, closed ? 'Арены закрыты 🛑' : 'В этом чате нет активных арен');
 }
 
 async function handleRender(request, env) {
@@ -398,11 +432,14 @@ export const internals = {
   handleWebhook,
   handleMessage,
   handleCallback,
+  handleStop,
   handleOffAll,
+  closeArenas,
   processFight,
   parseCallback,
   parseOffAll,
   isArenaCommand,
+  isStopCommand,
   normalizeText,
   displayName,
   rollStats,
